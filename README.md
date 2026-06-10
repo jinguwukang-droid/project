@@ -1,3 +1,6 @@
+This repo holds two small single-file apps: **Trackary** (a tracker) and
+**Brickland** (a mini Roblox-style 3D game — see the bottom of this file).
+
 # Trackary
 
 A tiny, zero-dependency app for tracking anything — habits, expenses, workouts,
@@ -35,3 +38,28 @@ All data stays in your browser under the localStorage key `trackary.v1`:
 
 The Export button produces this same structure, so exports are easy to inspect
 or process with other tools.
+
+# Brickland
+
+A single-file, single-player, Roblox-flavored 3D playground (`brickland.html`):
+a blocky avatar on a green baseplate, a third-person camera, a short obby
+(obstacle course) ending on a gold platform, and free building with colored
+blocks.
+
+## Run it
+
+Open `brickland.html` in a browser. It needs an internet connection the first
+time, to load Three.js from a CDN; everything else is in the file. A keyboard
+and mouse are required (no touch controls).
+
+## Controls
+
+| Input | Action |
+| --- | --- |
+| W A S D | move |
+| Space | jump |
+| Right-drag | rotate camera |
+| Scroll | zoom |
+| Left-click | place a block (pick colors at the bottom) |
+| Right-click | remove a block |
+| R | respawn |

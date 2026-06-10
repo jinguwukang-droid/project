@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Brickland</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body { font-family: ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  canvas { display: block; }
+
+  .panel {
+    position: fixed;
+    background: rgba(255,255,255,0.92);
+    border: 1px solid #d8d8d2;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    color: #1c1c1a;
+  }
+  #hud { top: 12px; left: 12px; max-width: 240px; }
+  #hud h1 { font-size: 14px; margin-bottom: 6px; }
+  #hud td { padding: 1px 8px 1px 0; color: #555; }
+  #hud td:first-child { color: #1c1c1a; font-weight: 600; white-space: nowrap; }
+
+  #palette {
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 6px;
+    padding: 8px;
+  }
+  .swatch {
+    width: 28px; height: 28px;
+    border-radius: 6px;
+    border: 2px solid transparent;
+    cursor: pointer;
+  }
+  .swatch.active { border-color: #1c1c1a; }
+
+  #banner {
+    top: 40%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 22px;
+    font-weight: 600;
+    padding: 18px 28px;
+    display: none;
+  }
+  #banner small { display: block; font-size: 13px; font-weight: 400; color: #555; margin-top: 6px; }
+
+  #loading {
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+  }
+</style>
+</head>
+<body>
+<div class="panel" id="loading">Loading 3D engine…</div>
+
+<div class="panel" id="hud" hidden>
+  <h1>Brickland</h1>
+  <table>
+    <tr><td>WASD</td><td>move</td></tr>
+    <tr><td>Space</td><td>jump</td></tr>
+    <tr><td>Right-drag</td><td>camera</td></tr>
+    <tr><td>Scroll</td><td>zoom</td></tr>
+    <tr><td>Left-click</td><td>place block</td></tr>
+    <tr><td>Right-click</td><td>remove block</td></tr>
+    <tr><td>R</td><td>respawn</td></tr>
+  </table>
+</div>
+
+<div class="panel" id="palette" hidden></div>
+
+<div class="panel" id="banner">🏆 You beat the obby!<small>Press R to respawn and run it again.</small></div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.149.0/build/three.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  if (typeof THREE === "undefined") {
+    document.getElementById("loading").textContent =
+      "Couldn't load the 3D engine (Three.js from CDN). Check your internet connection and reload.";
+    return;
+  }
+  document.getElementById("loading").remove();
+  document.getElementById("hud").hidden = false;
+  document.getElementById("palette").hidden = false;
+
+  // ---------- Scene ----------
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x87ceeb);
+  scene.fog = new THREE.Fog(0x87ceeb, 80, 220);
+
+  const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 500);
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  document.body.appendChild(renderer.domElement);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x88aa66, 0.65));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.85);
+  sun.position.set(40, 70, 25);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.camera.left = -70;
+  sun.shadow.camera.right = 70;
+  sun.shadow.camera.top = 70;
+  sun.shadow.camera.bottom = -70;
+  scene.add(sun);
+
+  const PLATE = 60; // baseplate half-extent
+  const baseplate = new THREE.Mesh(
+    new THREE.BoxGeometry(PLATE * 2, 1, PLATE * 2),
+    new THREE.MeshLambertMaterial({ color: 0x4a9e4a })
+  );
+  baseplate.position.y = -0.5;
+  baseplate.receiveShadow = true;
+  scene.add(baseplate);
+
+  const grid = new THREE.GridHelper(PLATE * 2, PLATE * 2, 0x000000, 0x000000);
+  grid.material.transparent = true;
+  grid.material.opacity = 0.08;
+  grid.position.y = 0.01;
+  scene.add(grid);
+
+  // ---------- Blocks (unit voxels on an integer grid) ----------
+
+  const blockGeo = new THREE.BoxGeometry(1, 1, 1);
+  const matCache = new Map();
+  function blockMat(color) {
+    if (!matCache.has(color)) matCache.set(color, new THREE.MeshLambertMaterial({ color }));
+    return matCache.get(color);
+  }
+
+  const blocks = new Map(); // "x,y,z" -> mesh; cell occupies [x,x+1]^3
+  const key = (x, y, z) => x + "," + y + "," + z;
+
+  function addBlock(x, y, z, color) {
+    const k = key(x, y, z);
+    if (blocks.has(k)) return;
+    const m = new THREE.Mesh(blockGeo, blockMat(color));
+    m.position.set(x + 0.5, y + 0.5, z + 0.5);
+    m.castShadow = true;
+    m.receiveShadow = true;
+    m.userData.cell = [x, y, z];
+    blocks.set(k, m);
+    scene.add(m);
+  }
+
+  function removeBlock(x, y, z) {
+    const k = key(x, y, z);
+    const m = blocks.get(k);
+    if (!m) return;
+    scene.remove(m);
+    blocks.delete(k);
+  }
+
+  // ---------- Pre-built obby ----------
+
+  function addPlatform(cx, y, cz, w, d, color) {
+    for (let x = cx - Math.floor(w / 2); x < cx - Math.floor(w / 2) + w; x++)
+      for (let z = cz - Math.floor(d / 2); z < cz - Math.floor(d / 2) + d; z++)
+        addBlock(x, y, z, color);
+  }
+
+  const OBBY = 0xc0c4cc;
+  addPlatform(8, 0, 0, 3, 3, OBBY);
+  addPlatform(13, 1, 2, 2, 2, OBBY);
+  addPlatform(17, 2, -1, 2, 2, OBBY);
+  addPlatform(21, 3, 2, 2, 2, OBBY);
+  addPlatform(25, 4, -1, 2, 2, OBBY);
+  addPlatform(29, 5, 2, 2, 2, OBBY);
+  addPlatform(33, 6, 0, 4, 4, 0xf2c200); // gold goal platform
+  const GOAL = { x: [31, 36], y: 7, z: [-2, 3] };
+
+  // ---------- Player ----------
+
+  function limb(w, h, d, color, px, py, pz) {
+    // Group pivots at the joint; the mesh hangs below it so rotation swings naturally.
+    const g = new THREE.Group();
+    g.position.set(px, py, pz);
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), blockMat(color));
+    m.position.y = -h / 2;
+    m.castShadow = true;
+    g.add(m);
+    return g;
+  }
+
+  const player = new THREE.Group();
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(1.0, 1.0, 0.5), blockMat(0x2a6bd6));
+  torso.position.y = 1.5;
+  torso.castShadow = true;
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.8, 0.8), blockMat(0xf5cd30));
+  head.position.y = 2.4;
+  head.castShadow = true;
+  const eyeMat = new THREE.MeshLambertMaterial({ color: 0x222222 });
+  for (const ex of [-0.18, 0.18]) {
+    const eye = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.14, 0.05), eyeMat);
+    eye.position.set(ex, 2.5, 0.41);
+    player.add(eye);
+  }
+  const leftLeg = limb(0.45, 1.0, 0.45, 0x3aa03a, -0.26, 1.0, 0);
+  const rightLeg = limb(0.45, 1.0, 0.45, 0x3aa03a, 0.26, 1.0, 0);
+  const leftArm = limb(0.4, 1.0, 0.4, 0xf5cd30, -0.7, 2.0, 0);
+  const rightArm = limb(0.4, 1.0, 0.4, 0xf5cd30, 0.7, 2.0, 0);
+  player.add(torso, head, leftLeg, rightLeg, leftArm, rightArm);
+  scene.add(player);
+
+  const SPAWN = new THREE.Vector3(0, 0, 0);
+  const pos = SPAWN.clone(); // feet position
+  const vel = new THREE.Vector3();
+  const HALF = 0.4, HEIGHT = 2.8, SPEED = 6, JUMP = 10, GRAVITY = 25;
+  let onGround = false;
+  let facing = 0;
+  let walkT = 0;
+  let won = false;
+
+  function respawn() {
+    pos.copy(SPAWN);
+    vel.set(0, 0, 0);
+    won = false;
+    document.getElementById("banner").style.display = "none";
+  }
+
+  // Axis-by-axis voxel collision against the block grid.
+  function collideAxis(axis, delta) {
+    if (delta === 0) return;
+    const min = [pos.x - HALF, pos.y, pos.z - HALF];
+    const max = [pos.x + HALF, pos.y + HEIGHT, pos.z + HALF];
+    const EPS = 0.001;
+    for (let x = Math.floor(min[0]); x <= Math.floor(max[0] - EPS); x++)
+      for (let y = Math.floor(min[1]); y <= Math.floor(max[1] - EPS); y++)
+        for (let z = Math.floor(min[2]); z <= Math.floor(max[2] - EPS); z++) {
+          if (!blocks.has(key(x, y, z))) continue;
+          if (axis === 0) pos.x = delta > 0 ? x - HALF - EPS : x + 1 + HALF + EPS;
+          if (axis === 2) pos.z = delta > 0 ? z - HALF - EPS : z + 1 + HALF + EPS;
+          if (axis === 1) {
+            if (delta > 0) { pos.y = y - HEIGHT - EPS; vel.y = 0; }
+            else { pos.y = y + 1 + EPS; vel.y = 0; onGround = true; }
+          }
+          return;
+        }
+  }
+
+  // ---------- Input ----------
+
+  const keys = {};
+  addEventListener("keydown", (e) => {
+    keys[e.code] = true;
+    if (e.code === "KeyR") respawn();
+    if (e.code === "Space") e.preventDefault();
+  });
+  addEventListener("keyup", (e) => { keys[e.code] = false; });
+
+  let yaw = -0.6, pitch = 0.35, dist = 13;
+  let orbiting = false;
+  let downAt = null; // [x, y, button] to tell clicks from drags
+  const mouse = new THREE.Vector2(2, 2); // offscreen until first move
+
+  renderer.domElement.addEventListener("contextmenu", (e) => e.preventDefault());
+  renderer.domElement.addEventListener("mousedown", (e) => {
+    downAt = [e.clientX, e.clientY, e.button];
+    if (e.button === 2) orbiting = true;
+  });
+  addEventListener("mouseup", (e) => {
+    orbiting = false;
+    if (!downAt) return;
+    const moved = Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]);
+    if (moved < 5) handleClick(downAt[2]);
+    downAt = null;
+  });
+  addEventListener("mousemove", (e) => {
+    mouse.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+    if (orbiting) {
+      yaw -= e.movementX * 0.005;
+      pitch = Math.min(1.3, Math.max(-0.3, pitch + e.movementY * 0.005));
+    }
+  });
+  addEventListener("wheel", (e) => {
+    dist = Math.min(28, Math.max(5, dist + Math.sign(e.deltaY) * 1.5));
+  });
+  addEventListener("resize", () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  // ---------- Building ----------
+
+  const COLORS = [0xd83a3a, 0xf08c00, 0xf2c200, 0x3aa03a, 0x2a6bd6, 0x8755d6, 0xeeeeee, 0x8a5a2b];
+  let currentColor = COLORS[0];
+  const paletteEl = document.getElementById("palette");
+  COLORS.forEach((c, i) => {
+    const s = document.createElement("div");
+    s.className = "swatch" + (i === 0 ? " active" : "");
+    s.style.background = "#" + c.toString(16).padStart(6, "0");
+    s.addEventListener("click", () => {
+      currentColor = c;
+      paletteEl.querySelectorAll(".swatch").forEach((x) => x.classList.remove("active"));
+      s.classList.add("active");
+    });
+    paletteEl.appendChild(s);
+  });
+
+  const raycaster = new THREE.Raycaster();
+  const ghost = new THREE.Mesh(
+    blockGeo,
+    new THREE.MeshLambertMaterial({ color: 0xffffff, transparent: true, opacity: 0.35 })
+  );
+  ghost.visible = false;
+  scene.add(ghost);
+
+  function pick() {
+    raycaster.setFromCamera(mouse, camera);
+    const targets = [baseplate, ...blocks.values()];
+    const hit = raycaster.intersectObjects(targets)[0];
+    if (!hit || hit.distance > 40) return null;
+    const n = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+    const placeP = hit.point.clone().addScaledVector(n, 0.5);
+    const removeP = hit.point.clone().addScaledVector(n, -0.5);
+    return {
+      place: [Math.floor(placeP.x), Math.floor(placeP.y), Math.floor(placeP.z)],
+      remove: hit.object === baseplate ? null : [Math.floor(removeP.x), Math.floor(removeP.y), Math.floor(removeP.z)],
+    };
+  }
+
+  function overlapsPlayer(x, y, z) {
+    return x + 1 > pos.x - HALF && x < pos.x + HALF &&
+           y + 1 > pos.y && y < pos.y + HEIGHT &&
+           z + 1 > pos.z - HALF && z < pos.z + HALF;
+  }
+
+  function handleClick(button) {
+    const p = pick();
+    if (!p) return;
+    if (button === 0) {
+      const [x, y, z] = p.place;
+      if (y >= 0 && !overlapsPlayer(x, y, z)) addBlock(x, y, z, currentColor);
+    } else if (button === 2 && p.remove) {
+      removeBlock(...p.remove);
+    }
+  }
+
+  // ---------- Main loop ----------
+
+  let last = performance.now();
+  function animate(now) {
+    requestAnimationFrame(animate);
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+
+    // Movement relative to camera yaw
+    const fwd = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+    const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+    const move = new THREE.Vector3();
+    if (keys.KeyW) move.add(fwd);
+    if (keys.KeyS) move.sub(fwd);
+    if (keys.KeyD) move.add(right);
+    if (keys.KeyA) move.sub(right);
+    if (move.lengthSq() > 0) move.normalize().multiplyScalar(SPEED);
+
+    if (keys.Space && onGround) vel.y = JUMP;
+    vel.y -= GRAVITY * dt;
+    onGround = false;
+
+    pos.x += move.x * dt;
+    collideAxis(0, move.x);
+    pos.z += move.z * dt;
+    collideAxis(2, move.z);
+    pos.y += vel.y * dt;
+    collideAxis(1, vel.y);
+
+    // Baseplate floor
+    if (pos.y < 0 && Math.abs(pos.x) <= PLATE && Math.abs(pos.z) <= PLATE) {
+      pos.y = 0;
+      vel.y = 0;
+      onGround = true;
+    }
+    if (pos.y < -40) respawn();
+
+    // Goal check
+    if (!won && onGround &&
+        pos.x >= GOAL.x[0] && pos.x <= GOAL.x[1] &&
+        pos.z >= GOAL.z[0] && pos.z <= GOAL.z[1] &&
+        Math.abs(pos.y - GOAL.y) < 0.5) {
+      won = true;
+      document.getElementById("banner").style.display = "block";
+    }
+
+    // Face movement direction; swing limbs while walking
+    const moving = move.lengthSq() > 0;
+    if (moving) {
+      const target = Math.atan2(move.x, move.z);
+      let d = target - facing;
+      while (d > Math.PI) d -= 2 * Math.PI;
+      while (d < -Math.PI) d += 2 * Math.PI;
+      facing += d * Math.min(1, dt * 12);
+      walkT += dt * 9;
+    } else {
+      walkT = 0;
+    }
+    const swing = moving ? Math.sin(walkT) * 0.7 : 0;
+    leftLeg.rotation.x = swing;
+    rightLeg.rotation.x = -swing;
+    leftArm.rotation.x = -swing * 0.8;
+    rightArm.rotation.x = swing * 0.8;
+
+    player.position.copy(pos);
+    player.rotation.y = facing;
+
+    // Third-person camera
+    const eye = new THREE.Vector3(
+      pos.x + Math.sin(yaw) * Math.cos(pitch) * dist,
+      Math.max(pos.y + 2.2 + Math.sin(pitch) * dist, 0.5),
+      pos.z + Math.cos(yaw) * Math.cos(pitch) * dist
+    );
+    camera.position.copy(eye);
+    camera.lookAt(pos.x, pos.y + 2.2, pos.z);
+
+    // Build preview
+    const p = pick();
+    if (p) {
+      ghost.visible = true;
+      ghost.position.set(p.place[0] + 0.5, p.place[1] + 0.5, p.place[2] + 0.5);
+    } else {
+      ghost.visible = false;
+    }
+
+    renderer.render(scene, camera);
+  }
+  requestAnimationFrame(animate);
+})();
+</script>
+</body>
+</html>
